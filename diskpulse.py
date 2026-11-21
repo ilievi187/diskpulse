@@ -53,6 +53,24 @@ def human_bytes(n: int) -> str:
 
 REAL_FS_TYPES = {"ext4", "ext3", "btrfs", "xfs", "f2fs", "zfs", "ntfs", "ntfs3", "vfat", "exfat", "fuseblk"}
 SKIP_MOUNT_PREFIXES = ("/boot", "/efi", "/snap", "/var/lib/docker", "/proc", "/sys", "/dev", "/run/credentials")
+CLOUD_OR_NET_FS_PREFIXES = ("fuse.rclone", "fuse.gvfs", "fuse.google", "fuse.sshfs", "fuse.onedrive", "fuse.dropbox", "nfs", "cifs", "smb", "davfs")
+
+
+def _cloud_or_network_mounts() -> set[str]:
+    """Return mountpoints backed by cloud/network/FUSE filesystems (e.g. Google Drive, rclone, gvfs)."""
+    mounts: set[str] = set()
+    try:
+        text = Path("/proc/mounts").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return mounts
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        mount, fstype = parts[1].replace("\\040", " "), parts[2].lower()
+        if fstype.startswith(CLOUD_OR_NET_FS_PREFIXES) or (fstype.startswith("fuse.") and fstype != "fuseblk"):
+            mounts.add(mount)
+    return mounts
 
 
 def get_disk_overview(target: Path | str | None = None, label: str = "") -> DiskOverview:
@@ -116,7 +134,7 @@ def list_mounted_disks() -> list[DiskOverview]:
     return disks
 
 
-def _du_bytes(path: Path, one_file_system: bool = False) -> int:
+def _du_bytes(path: Path, one_file_system: bool = True) -> int:
     if not path.exists():
         return 0
     try:
@@ -128,10 +146,14 @@ def _du_bytes(path: Path, one_file_system: bool = False) -> int:
         pass
     total = 0
     try:
+        root_dev = path.stat().st_dev if one_file_system else None
         for p in path.rglob("*"):
             if p.is_file() and not p.is_symlink():
                 try:
-                    total += p.stat().st_size
+                    st = p.stat()
+                    if root_dev is not None and st.st_dev != root_dev:
+                        continue
+                    total += st.st_size
                 except OSError:
                     pass
     except OSError:
@@ -143,16 +165,33 @@ def scan_top_folders(
     target: Path | str | None = None,
     limit: int = 15,
     on_progress: Optional[Callable[[int, str], None]] = None,
+    should_cancel: Optional[Callable[[], bool]] = None,
 ) -> list[FolderEntry]:
     root = Path(target) if target is not None else Path.home()
     if not root.exists():
         return []
     skip_root_dirs = {"proc", "sys", "dev", "run", "tmp"} if str(root) == "/" else set()
+    cloud_mounts = _cloud_or_network_mounts()
     try:
-        candidates = sorted(
-            [p for p in root.iterdir() if p.is_dir() and not p.is_symlink() and p.name not in skip_root_dirs],
-            key=lambda p: p.name.lower(),
-        )
+        root_dev = root.stat().st_dev
+    except OSError:
+        root_dev = None
+
+    try:
+        candidates = []
+        for p in sorted(root.iterdir(), key=lambda x: x.name.lower()):
+            if not p.is_dir() or p.is_symlink() or p.name in skip_root_dirs:
+                continue
+            p_str = str(p)
+            # Never auto-traverse cloud/FUSE/network mounts (e.g. Google Drive, rclone, gvfs)
+            if p_str in cloud_mounts:
+                continue
+            try:
+                if root_dev is not None and p.stat().st_dev != root_dev:
+                    continue
+            except OSError:
+                continue
+            candidates.append(p)
     except PermissionError:
         return []
     if not candidates:
@@ -160,12 +199,13 @@ def scan_top_folders(
 
     entries: list[FolderEntry] = []
     total = len(candidates)
-    one_fs = str(root) == "/"
     for idx, folder in enumerate(candidates, start=1):
+        if should_cancel and should_cancel():
+            return entries
         if on_progress:
             pct = 35 + int((idx / total) * 63)
             on_progress(pct, f"Scanning {idx}/{total}: {folder}")
-        size = _du_bytes(folder, one_file_system=one_fs)
+        size = _du_bytes(folder, one_file_system=True)
         if size > 0:
             entries.append(FolderEntry(name=folder.name, path=folder, size_bytes=size))
 
@@ -184,6 +224,7 @@ def scan_top_home_folders(
 
 def scan_safe_caches(
     on_progress: Optional[Callable[[int, str], None]] = None,
+    should_cancel: Optional[Callable[[], bool]] = None,
 ) -> list[CacheTarget]:
     home = Path.home()
     specs = [
@@ -202,12 +243,14 @@ def scan_safe_caches(
     found: list[CacheTarget] = []
     total = len(specs)
     for idx, (cid, title, desc, path, direct, hint) in enumerate(specs, start=1):
+        if should_cancel and should_cancel():
+            return found
         if on_progress:
             pct = 5 + int((idx / total) * 30)
             on_progress(pct, f"Checking cache {idx}/{total}: {title}")
         if not path.exists():
             continue
-        size = _du_bytes(path)
+        size = _du_bytes(path, one_file_system=True)
         if size > 1024 * 1024:  # Show caches > 1 MB
             found.append(CacheTarget(cid, title, desc, path, size, direct, hint))
 

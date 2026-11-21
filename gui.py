@@ -65,19 +65,30 @@ class GlowButton(QPushButton):
 
 class ScanWorker(QThread):
     progress = Signal(int, str)
-    scanned = Signal(object, object, object, object)
+    scanned = Signal(object, object, object, object, bool)
 
     def __init__(self, target_path: Path) -> None:
         super().__init__()
         self._target = target_path
 
     def run(self) -> None:
+        cancelled = lambda: self.isInterruptionRequested()
         self.progress.emit(2, f"Inspecting disks & {self._target}...")
         disks = dp.list_mounted_disks()
         overview = dp.get_disk_overview(self._target)
-        caches = dp.scan_safe_caches(on_progress=lambda pct, msg: self.progress.emit(pct, msg))
-        folders = dp.scan_top_folders(self._target, 15, on_progress=lambda pct, msg: self.progress.emit(pct, msg))
-        self.scanned.emit(disks, overview, caches, folders)
+        caches = dp.scan_safe_caches(
+            on_progress=lambda pct, msg: self.progress.emit(pct, msg),
+            should_cancel=cancelled,
+        )
+        folders = []
+        if not cancelled():
+            folders = dp.scan_top_folders(
+                self._target,
+                15,
+                on_progress=lambda pct, msg: self.progress.emit(pct, msg),
+                should_cancel=cancelled,
+            )
+        self.scanned.emit(disks, overview, caches, folders, cancelled())
 
 
 class DiskPulseWindow(QMainWindow):
@@ -87,11 +98,11 @@ class DiskPulseWindow(QMainWindow):
         self.palette_data: ThemePalette = watcher.palette
         self.selected_path: Path = Path.home()
         self.disks: list[dp.DiskOverview] = dp.list_mounted_disks()
-        self.overview: dp.DiskOverview | None = None
+        self.overview: dp.DiskOverview | None = dp.get_disk_overview(self.selected_path)
         self.caches: list[dp.CacheTarget] = []
         self.folders: list[dp.FolderEntry] = []
+        self._has_scanned: bool = False
         self._worker: ScanWorker | None = None
-        self._pending_rescan: bool = False
         self._glow_buttons: list[GlowButton] = []
 
         self.setWindowTitle("DiskPulse — Linux Disk Analyzer & Cache Cleaner")
@@ -100,10 +111,9 @@ class DiskPulseWindow(QMainWindow):
 
         self._build_ui()
         self._bind_shortcuts()
+        self._update_header_overview()
         self.apply_theme(self.palette_data)
         self.watcher.theme_changed.connect(self.apply_theme)
-
-        QTimer.singleShot(40, self.start_scan)
 
     def _btn(self, text: str, obj_name: str = "", blur: float = 16.0) -> GlowButton:
         b = GlowButton(text, glow_hex=self.palette_data.accent, max_blur=blur)
@@ -145,12 +155,12 @@ class DiskPulseWindow(QMainWindow):
         top.addLayout(tcol)
         top.addStretch()
 
-        self.reclaim_pill = QLabel("0 B Reclaimable")
+        self.reclaim_pill = QLabel("Ready to Scan")
         self.reclaim_pill.setObjectName("StatPill")
         top.addWidget(self.reclaim_pill)
 
-        self.rescan_btn = self._btn("↻  Rescan", obj_name="PrimaryButton", blur=20.0)
-        self.rescan_btn.clicked.connect(self.start_scan)
+        self.rescan_btn = self._btn("🔍  Scan", obj_name="PrimaryButton", blur=20.0)
+        self.rescan_btn.clicked.connect(self._toggle_scan)
         top.addWidget(self.rescan_btn)
         hc.addLayout(top)
 
@@ -285,23 +295,47 @@ class DiskPulseWindow(QMainWindow):
         self.disks_bar.addWidget(browse_btn)
         self.disks_bar.addStretch()
 
+    def _update_header_overview(self) -> None:
+        try:
+            self.overview = dp.get_disk_overview(self.selected_path)
+        except OSError:
+            return
+        ov = self.overview
+        self.disk_bar.setValue(int(ov.used_percent))
+        self.disk_sub.setText(
+            f"{ov.mount} · {dp.human_bytes(ov.used_bytes)} used of {dp.human_bytes(ov.total_bytes)} "
+            f"· {dp.human_bytes(ov.free_bytes)} free ({ov.used_percent:.0f}%)"
+        )
+
     def _select_disk(self, path: Path) -> None:
         self.selected_path = path
+        self._has_scanned = False
+        self.folders = []
+        self._update_header_overview()
         self._render_disk_chips()
-        self.start_scan()
+        self.status_lbl.setText(f"Selected {path} — click Scan to analyze")
+        self._render()
 
     def _pick_custom_folder(self) -> None:
         chosen = QFileDialog.getExistingDirectory(self, "Select Disk or Folder to Analyze", str(self.selected_path))
         if chosen:
             self._select_disk(Path(chosen))
 
+    def _toggle_scan(self) -> None:
+        if self._worker is not None and self._worker.isRunning():
+            self._worker.requestInterruption()
+            self.rescan_btn.setEnabled(False)
+            self.scan_msg_lbl.setText("Stopping scan...")
+            self.status_lbl.setText("Stopping scan...")
+        else:
+            self.start_scan()
+
     def start_scan(self) -> None:
         if self._worker is not None:
-            self._pending_rescan = True
             return
-        self._pending_rescan = False
         self.status_lbl.setText(f"Scanning {self.selected_path}...")
-        self.rescan_btn.setEnabled(False)
+        self.rescan_btn.setText("■  Stop")
+        self.rescan_btn.setEnabled(True)
         self.scan_bar.setValue(0)
         self.scan_pct_lbl.setText("0%")
         self.scan_msg_lbl.setText(f"Starting scan of {self.selected_path}...")
@@ -323,30 +357,29 @@ class DiskPulseWindow(QMainWindow):
         overview: dp.DiskOverview,
         caches: list[dp.CacheTarget],
         folders: list[dp.FolderEntry],
+        was_cancelled: bool,
     ) -> None:
         self._worker = None
+        self.rescan_btn.setText("🔍  Scan")
         self.rescan_btn.setEnabled(True)
-        self.scan_bar.setValue(100)
-        self.scan_pct_lbl.setText("100%")
         self.scan_panel.hide()
         self.disks = disks
         self._render_disk_chips()
         self.overview = overview
+        self._update_header_overview()
+
+        if was_cancelled:
+            self.status_lbl.setText(f"Scan stopped for {overview.mount}")
+            self._show_toast("Scan stopped")
+            return
+
+        self._has_scanned = True
         self.caches = caches
         self.folders = folders
-
-        self.disk_bar.setValue(int(overview.used_percent))
-        self.disk_sub.setText(
-            f"{overview.mount} · {dp.human_bytes(overview.used_bytes)} used of {dp.human_bytes(overview.total_bytes)} "
-            f"· {dp.human_bytes(overview.free_bytes)} free ({overview.used_percent:.0f}%)"
-        )
         reclaim = sum(c.size_bytes for c in caches if c.can_clean_directly)
         self.reclaim_pill.setText(f"{dp.human_bytes(reclaim)} Safe Cache")
         self.status_lbl.setText(f"Scanned {overview.mount} · {len(caches)} cache(s), {len(folders)} top folders")
         self._render()
-        if self._pending_rescan:
-            self._pending_rescan = False
-            self.start_scan()
 
     def _render(self) -> None:
         while self.body_layout.count():
@@ -355,6 +388,38 @@ class DiskPulseWindow(QMainWindow):
                 item.widget().deleteLater()
 
         p = self.palette_data
+
+        if not self._has_scanned:
+            empty_card = QFrame()
+            empty_card.setObjectName("JobCard")
+            el = QVBoxLayout(empty_card)
+            el.setContentsMargins(28, 36, 28, 36)
+            el.setSpacing(10)
+            el.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+            em_title = QLabel(f"Ready to analyze {self.selected_path}")
+            em_title.setStyleSheet("font-size: 16px; font-weight: 700;")
+            em_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+            em_sub = QLabel(
+                "Pick a mounted disk or custom folder above, then click Scan.\n"
+                "Cloud & network mounts (Google Drive, rclone, SSHFS, etc.) are automatically skipped."
+            )
+            em_sub.setObjectName("SubtitleLabel")
+            em_sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+            scan_now = GlowButton("🔍  Start Scan", glow_hex=p.accent, max_blur=20.0)
+            scan_now.setObjectName("PrimaryButton")
+            scan_now.setFixedWidth(180)
+            scan_now.clicked.connect(self.start_scan)
+
+            el.addWidget(em_title)
+            el.addWidget(em_sub)
+            el.addSpacing(6)
+            el.addWidget(scan_now, alignment=Qt.AlignmentFlag.AlignCenter)
+            self.body_layout.addWidget(empty_card)
+            self.body_layout.addStretch()
+            return
 
         # Section 1: Safe Cache Cleaner
         c_title = QLabel("Safe Cache Cleaner")

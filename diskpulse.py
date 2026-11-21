@@ -11,7 +11,10 @@ from typing import Callable, Optional
 
 @dataclass
 class DiskOverview:
+    label: str
     mount: str
+    device: str
+    fstype: str
     total_bytes: int
     used_bytes: int
     free_bytes: int
@@ -48,16 +51,77 @@ def human_bytes(n: int) -> str:
     return f"{n} B"
 
 
-def get_disk_overview() -> DiskOverview:
-    u = shutil.disk_usage(Path.home())
-    return DiskOverview(mount=str(Path.home()), total_bytes=u.total, used_bytes=u.used, free_bytes=u.free)
+REAL_FS_TYPES = {"ext4", "ext3", "btrfs", "xfs", "f2fs", "zfs", "ntfs", "ntfs3", "vfat", "exfat", "fuseblk"}
+SKIP_MOUNT_PREFIXES = ("/boot", "/efi", "/snap", "/var/lib/docker", "/proc", "/sys", "/dev", "/run/credentials")
 
 
-def _du_bytes(path: Path) -> int:
+def get_disk_overview(target: Path | str | None = None, label: str = "") -> DiskOverview:
+    path = Path(target) if target is not None else Path.home()
+    u = shutil.disk_usage(path)
+    lbl = label or ("Home (~)" if path == Path.home() else (path.name or str(path)))
+    return DiskOverview(
+        label=lbl,
+        mount=str(path),
+        device="",
+        fstype="",
+        total_bytes=u.total,
+        used_bytes=u.used,
+        free_bytes=u.free,
+    )
+
+
+def list_mounted_disks() -> list[DiskOverview]:
+    """Discover real mounted Linux disks & partitions plus Home (~)."""
+    disks: list[DiskOverview] = [get_disk_overview(Path.home(), label="Home (~)")]
+    seen_mounts: set[str] = {str(Path.home())}
+    seen_devices: set[str] = set()
+
+    try:
+        mounts_text = Path("/proc/mounts").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return disks
+
+    for line in mounts_text.splitlines():
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        dev, mount, fstype = parts[0], parts[1].replace("\\040", " "), parts[2]
+        if fstype not in REAL_FS_TYPES:
+            continue
+        if any(mount.startswith(pref) for pref in SKIP_MOUNT_PREFIXES):
+            continue
+        if mount in seen_mounts or (dev.startswith("/dev/") and dev in seen_devices and mount != "/"):
+            continue
+        try:
+            u = shutil.disk_usage(mount)
+        except OSError:
+            continue
+        if u.total < 100 * 1024 * 1024:  # skip tiny <100MB virtual mounts
+            continue
+        seen_mounts.add(mount)
+        if dev.startswith("/dev/"):
+            seen_devices.add(dev)
+        label = "Root (/)" if mount == "/" else Path(mount).name or mount
+        disks.append(
+            DiskOverview(
+                label=label,
+                mount=mount,
+                device=dev,
+                fstype=fstype,
+                total_bytes=u.total,
+                used_bytes=u.used,
+                free_bytes=u.free,
+            )
+        )
+    return disks
+
+
+def _du_bytes(path: Path, one_file_system: bool = False) -> int:
     if not path.exists():
         return 0
     try:
-        res = subprocess.run(["du", "-sb", str(path)], capture_output=True, text=True, timeout=15)
+        cmd = ["du", "-sbx" if one_file_system else "-sb", str(path)]
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
         if res.returncode == 0 and res.stdout.strip():
             return int(res.stdout.split()[0])
     except Exception:
@@ -75,31 +139,47 @@ def _du_bytes(path: Path) -> int:
     return total
 
 
-def scan_top_home_folders(
-    limit: int = 12,
+def scan_top_folders(
+    target: Path | str | None = None,
+    limit: int = 15,
     on_progress: Optional[Callable[[int, str], None]] = None,
 ) -> list[FolderEntry]:
-    home = Path.home()
-    candidates = sorted(
-        [p for p in home.iterdir() if p.is_dir() and not p.is_symlink()],
-        key=lambda p: p.name.lower(),
-    )
+    root = Path(target) if target is not None else Path.home()
+    if not root.exists():
+        return []
+    skip_root_dirs = {"proc", "sys", "dev", "run", "tmp"} if str(root) == "/" else set()
+    try:
+        candidates = sorted(
+            [p for p in root.iterdir() if p.is_dir() and not p.is_symlink() and p.name not in skip_root_dirs],
+            key=lambda p: p.name.lower(),
+        )
+    except PermissionError:
+        return []
     if not candidates:
         return []
 
     entries: list[FolderEntry] = []
     total = len(candidates)
+    one_fs = str(root) == "/"
     for idx, folder in enumerate(candidates, start=1):
         if on_progress:
             pct = 35 + int((idx / total) * 63)
-            on_progress(pct, f"Scanning folder {idx}/{total}: ~/{folder.name}")
-        size = _du_bytes(folder)
-        entries.append(FolderEntry(name=folder.name, path=folder, size_bytes=size))
+            on_progress(pct, f"Scanning {idx}/{total}: {folder}")
+        size = _du_bytes(folder, one_file_system=one_fs)
+        if size > 0:
+            entries.append(FolderEntry(name=folder.name, path=folder, size_bytes=size))
 
     entries.sort(key=lambda e: e.size_bytes, reverse=True)
     if on_progress:
         on_progress(100, "Scan complete")
     return entries[:limit]
+
+
+def scan_top_home_folders(
+    limit: int = 12,
+    on_progress: Optional[Callable[[int, str], None]] = None,
+) -> list[FolderEntry]:
+    return scan_top_folders(Path.home(), limit=limit, on_progress=on_progress)
 
 
 def scan_safe_caches(

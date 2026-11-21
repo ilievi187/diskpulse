@@ -4,11 +4,13 @@
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 
 from PySide6.QtCore import QEasingCurve, QPropertyAnimation, QUrl, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QColor, QDesktopServices, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
+    QFileDialog,
     QFrame,
     QGraphicsDropShadowEffect,
     QHBoxLayout,
@@ -63,14 +65,19 @@ class GlowButton(QPushButton):
 
 class ScanWorker(QThread):
     progress = Signal(int, str)
-    scanned = Signal(object, object, object)
+    scanned = Signal(object, object, object, object)
+
+    def __init__(self, target_path: Path) -> None:
+        super().__init__()
+        self._target = target_path
 
     def run(self) -> None:
-        self.progress.emit(2, "Reading filesystem overview...")
-        overview = dp.get_disk_overview()
+        self.progress.emit(2, f"Inspecting disks & {self._target}...")
+        disks = dp.list_mounted_disks()
+        overview = dp.get_disk_overview(self._target)
         caches = dp.scan_safe_caches(on_progress=lambda pct, msg: self.progress.emit(pct, msg))
-        folders = dp.scan_top_home_folders(12, on_progress=lambda pct, msg: self.progress.emit(pct, msg))
-        self.scanned.emit(overview, caches, folders)
+        folders = dp.scan_top_folders(self._target, 15, on_progress=lambda pct, msg: self.progress.emit(pct, msg))
+        self.scanned.emit(disks, overview, caches, folders)
 
 
 class DiskPulseWindow(QMainWindow):
@@ -78,10 +85,13 @@ class DiskPulseWindow(QMainWindow):
         super().__init__()
         self.watcher = watcher
         self.palette_data: ThemePalette = watcher.palette
+        self.selected_path: Path = Path.home()
+        self.disks: list[dp.DiskOverview] = dp.list_mounted_disks()
         self.overview: dp.DiskOverview | None = None
         self.caches: list[dp.CacheTarget] = []
         self.folders: list[dp.FolderEntry] = []
         self._worker: ScanWorker | None = None
+        self._pending_rescan: bool = False
         self._glow_buttons: list[GlowButton] = []
 
         self.setWindowTitle("DiskPulse — Linux Disk Analyzer & Cache Cleaner")
@@ -150,6 +160,12 @@ class DiskPulseWindow(QMainWindow):
         self.disk_bar.setTextVisible(False)
         hc.addWidget(self.disk_bar)
         root.addWidget(header_card)
+
+        # Disk / Drive Selector Bar
+        self.disks_bar = QHBoxLayout()
+        self.disks_bar.setSpacing(8)
+        root.addLayout(self.disks_bar)
+        self._render_disk_chips()
 
         # Toast
         self.toast = QFrame()
@@ -233,6 +249,7 @@ class DiskPulseWindow(QMainWindow):
         for b in self._glow_buttons:
             b.update_glow_color(palette.accent)
         self.theme_lbl.setText(f"{palette.source_name} ({palette.mode}) · {palette.accent}")
+        self._render_disk_chips()
         self._render()
 
     def _show_toast(self, msg: str) -> None:
@@ -240,16 +257,56 @@ class DiskPulseWindow(QMainWindow):
         self.toast.show()
         QTimer.singleShot(4000, self.toast.hide)
 
+    def _render_disk_chips(self) -> None:
+        while self.disks_bar.count():
+            item = self.disks_bar.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        lbl = QLabel("Disk:")
+        lbl.setObjectName("SubtitleLabel")
+        self.disks_bar.addWidget(lbl)
+
+        for d in self.disks:
+            chip = GlowButton(
+                f"💾  {d.label} ({dp.human_bytes(d.free_bytes)} free)",
+                glow_hex=self.palette_data.accent,
+                max_blur=14.0,
+            )
+            chip.setObjectName("ChipButton")
+            chip.setCheckable(True)
+            chip.setChecked(str(self.selected_path) == d.mount)
+            chip.clicked.connect(lambda checked=False, m=d.mount: self._select_disk(Path(m)))
+            self.disks_bar.addWidget(chip)
+
+        browse_btn = GlowButton("📁  Custom Folder...", glow_hex=self.palette_data.accent, max_blur=14.0)
+        browse_btn.setObjectName("CardAction")
+        browse_btn.clicked.connect(self._pick_custom_folder)
+        self.disks_bar.addWidget(browse_btn)
+        self.disks_bar.addStretch()
+
+    def _select_disk(self, path: Path) -> None:
+        self.selected_path = path
+        self._render_disk_chips()
+        self.start_scan()
+
+    def _pick_custom_folder(self) -> None:
+        chosen = QFileDialog.getExistingDirectory(self, "Select Disk or Folder to Analyze", str(self.selected_path))
+        if chosen:
+            self._select_disk(Path(chosen))
+
     def start_scan(self) -> None:
         if self._worker is not None:
+            self._pending_rescan = True
             return
-        self.status_lbl.setText("Scanning home folders and caches...")
+        self._pending_rescan = False
+        self.status_lbl.setText(f"Scanning {self.selected_path}...")
         self.rescan_btn.setEnabled(False)
         self.scan_bar.setValue(0)
         self.scan_pct_lbl.setText("0%")
-        self.scan_msg_lbl.setText("Starting disk scan...")
+        self.scan_msg_lbl.setText(f"Starting scan of {self.selected_path}...")
         self.scan_panel.show()
-        self._worker = ScanWorker()
+        self._worker = ScanWorker(self.selected_path)
         self._worker.progress.connect(self._on_progress)
         self._worker.scanned.connect(self._on_scanned)
         self._worker.start()
@@ -260,25 +317,36 @@ class DiskPulseWindow(QMainWindow):
         self.scan_msg_lbl.setText(message)
         self.status_lbl.setText(f"{message} ({pct}%)")
 
-    def _on_scanned(self, overview: dp.DiskOverview, caches: list[dp.CacheTarget], folders: list[dp.FolderEntry]) -> None:
+    def _on_scanned(
+        self,
+        disks: list[dp.DiskOverview],
+        overview: dp.DiskOverview,
+        caches: list[dp.CacheTarget],
+        folders: list[dp.FolderEntry],
+    ) -> None:
         self._worker = None
         self.rescan_btn.setEnabled(True)
         self.scan_bar.setValue(100)
         self.scan_pct_lbl.setText("100%")
         self.scan_panel.hide()
+        self.disks = disks
+        self._render_disk_chips()
         self.overview = overview
         self.caches = caches
         self.folders = folders
 
         self.disk_bar.setValue(int(overview.used_percent))
         self.disk_sub.setText(
-            f"{dp.human_bytes(overview.used_bytes)} used of {dp.human_bytes(overview.total_bytes)} "
+            f"{overview.mount} · {dp.human_bytes(overview.used_bytes)} used of {dp.human_bytes(overview.total_bytes)} "
             f"· {dp.human_bytes(overview.free_bytes)} free ({overview.used_percent:.0f}%)"
         )
         reclaim = sum(c.size_bytes for c in caches if c.can_clean_directly)
         self.reclaim_pill.setText(f"{dp.human_bytes(reclaim)} Safe Cache")
-        self.status_lbl.setText(f"Found {len(caches)} cache(s) and {len(folders)} top folders")
+        self.status_lbl.setText(f"Scanned {overview.mount} · {len(caches)} cache(s), {len(folders)} top folders")
         self._render()
+        if self._pending_rescan:
+            self._pending_rescan = False
+            self.start_scan()
 
     def _render(self) -> None:
         while self.body_layout.count():
@@ -332,8 +400,8 @@ class DiskPulseWindow(QMainWindow):
 
                 self.body_layout.addWidget(card)
 
-        # Section 2: Largest Folders in Home
-        f_title = QLabel("Largest Folders in Home")
+        # Section 2: Largest Folders on Selected Disk
+        f_title = QLabel(f"Largest Folders in {self.selected_path}")
         f_title.setStyleSheet("font-size: 15px; font-weight: 700; margin-top: 8px;")
         self.body_layout.addWidget(f_title)
 
@@ -368,6 +436,13 @@ class DiskPulseWindow(QMainWindow):
             self.body_layout.addWidget(card)
 
         self.body_layout.addStretch()
+
+    def closeEvent(self, event) -> None:
+        if self._worker is not None and self._worker.isRunning():
+            self._worker.requestInterruption()
+            self._worker.terminate()
+            self._worker.wait(1000)
+        super().closeEvent(event)
 
     def _clean_target(self, target: dp.CacheTarget) -> None:
         reply = QMessageBox.question(

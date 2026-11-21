@@ -6,6 +6,7 @@ import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable, Optional
 
 
 @dataclass
@@ -74,34 +75,36 @@ def _du_bytes(path: Path) -> int:
     return total
 
 
-def scan_top_home_folders(limit: int = 12) -> list[FolderEntry]:
+def scan_top_home_folders(
+    limit: int = 12,
+    on_progress: Optional[Callable[[int, str], None]] = None,
+) -> list[FolderEntry]:
     home = Path.home()
-    candidates = [p for p in home.iterdir() if p.is_dir() and not p.is_symlink()]
+    candidates = sorted(
+        [p for p in home.iterdir() if p.is_dir() and not p.is_symlink()],
+        key=lambda p: p.name.lower(),
+    )
     if not candidates:
         return []
 
     entries: list[FolderEntry] = []
-    try:
-        res = subprocess.run(
-            ["du", "-sb", "--", *[str(p) for p in candidates]],
-            capture_output=True,
-            text=True,
-            timeout=25,
-        )
-        for line in res.stdout.splitlines():
-            parts = line.split("\t", 1)
-            if len(parts) == 2 and parts[0].isdigit():
-                p = Path(parts[1])
-                entries.append(FolderEntry(name=p.name, path=p, size_bytes=int(parts[0])))
-    except Exception:
-        for p in candidates:
-            entries.append(FolderEntry(name=p.name, path=p, size_bytes=_du_bytes(p)))
+    total = len(candidates)
+    for idx, folder in enumerate(candidates, start=1):
+        if on_progress:
+            pct = 35 + int((idx / total) * 63)
+            on_progress(pct, f"Scanning folder {idx}/{total}: ~/{folder.name}")
+        size = _du_bytes(folder)
+        entries.append(FolderEntry(name=folder.name, path=folder, size_bytes=size))
 
     entries.sort(key=lambda e: e.size_bytes, reverse=True)
+    if on_progress:
+        on_progress(100, "Scan complete")
     return entries[:limit]
 
 
-def scan_safe_caches() -> list[CacheTarget]:
+def scan_safe_caches(
+    on_progress: Optional[Callable[[int, str], None]] = None,
+) -> list[CacheTarget]:
     home = Path.home()
     specs = [
         ("trash", "Trash / Recycle Bin", "Deleted files waiting in your user Trash", home / ".local/share/Trash/files", True, ""),
@@ -117,7 +120,11 @@ def scan_safe_caches() -> list[CacheTarget]:
     ]
 
     found: list[CacheTarget] = []
-    for cid, title, desc, path, direct, hint in specs:
+    total = len(specs)
+    for idx, (cid, title, desc, path, direct, hint) in enumerate(specs, start=1):
+        if on_progress:
+            pct = 5 + int((idx / total) * 30)
+            on_progress(pct, f"Checking cache {idx}/{total}: {title}")
         if not path.exists():
             continue
         size = _du_bytes(path)

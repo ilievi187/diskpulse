@@ -62,12 +62,14 @@ class GlowButton(QPushButton):
 
 
 class ScanWorker(QThread):
+    progress = Signal(int, str)
     scanned = Signal(object, object, object)
 
     def run(self) -> None:
+        self.progress.emit(2, "Reading filesystem overview...")
         overview = dp.get_disk_overview()
-        caches = dp.scan_safe_caches()
-        folders = dp.scan_top_home_folders(12)
+        caches = dp.scan_safe_caches(on_progress=lambda pct, msg: self.progress.emit(pct, msg))
+        folders = dp.scan_top_home_folders(12, on_progress=lambda pct, msg: self.progress.emit(pct, msg))
         self.scanned.emit(overview, caches, folders)
 
 
@@ -170,6 +172,29 @@ class DiskPulseWindow(QMainWindow):
         self.scroll.setWidget(self.body_widget)
         root.addWidget(self.scroll, 1)
 
+        # Bottom real-time scan progress panel (visible while scanning)
+        self.scan_panel = QFrame()
+        self.scan_panel.setObjectName("ToastBanner")
+        sp_layout = QVBoxLayout(self.scan_panel)
+        sp_layout.setContentsMargins(14, 10, 14, 10)
+        sp_layout.setSpacing(6)
+        sp_top = QHBoxLayout()
+        self.scan_msg_lbl = QLabel("Scanning...")
+        self.scan_msg_lbl.setStyleSheet("font-weight: 600; font-size: 12px;")
+        self.scan_pct_lbl = QLabel("0%")
+        self.scan_pct_lbl.setStyleSheet("font-weight: 700; font-size: 12px;")
+        sp_top.addWidget(self.scan_msg_lbl, 1)
+        sp_top.addWidget(self.scan_pct_lbl)
+        self.scan_bar = QProgressBar()
+        self.scan_bar.setRange(0, 100)
+        self.scan_bar.setValue(0)
+        self.scan_bar.setFixedHeight(8)
+        self.scan_bar.setTextVisible(False)
+        sp_layout.addLayout(sp_top)
+        sp_layout.addWidget(self.scan_bar)
+        self.scan_panel.hide()
+        root.addWidget(self.scan_panel)
+
         # Footer
         footer = QHBoxLayout()
         self.status_lbl = QLabel("Ready")
@@ -220,13 +245,27 @@ class DiskPulseWindow(QMainWindow):
             return
         self.status_lbl.setText("Scanning home folders and caches...")
         self.rescan_btn.setEnabled(False)
+        self.scan_bar.setValue(0)
+        self.scan_pct_lbl.setText("0%")
+        self.scan_msg_lbl.setText("Starting disk scan...")
+        self.scan_panel.show()
         self._worker = ScanWorker()
+        self._worker.progress.connect(self._on_progress)
         self._worker.scanned.connect(self._on_scanned)
         self._worker.start()
+
+    def _on_progress(self, pct: int, message: str) -> None:
+        self.scan_bar.setValue(pct)
+        self.scan_pct_lbl.setText(f"{pct}%")
+        self.scan_msg_lbl.setText(message)
+        self.status_lbl.setText(f"{message} ({pct}%)")
 
     def _on_scanned(self, overview: dp.DiskOverview, caches: list[dp.CacheTarget], folders: list[dp.FolderEntry]) -> None:
         self._worker = None
         self.rescan_btn.setEnabled(True)
+        self.scan_bar.setValue(100)
+        self.scan_pct_lbl.setText("100%")
+        self.scan_panel.hide()
         self.overview = overview
         self.caches = caches
         self.folders = folders
